@@ -272,11 +272,11 @@
           <p style="margin:8px 0 0;color:var(--muted)">Escolha o perfil e informe a senha local para abrir o painel.</p>
         </div>
         <div class="access-grid">
-          <div class="access-card active" id="card-almoxarife" >
+          <div class="access-card active" id="card-almoxarife" onclick="selectRole('almoxarife')">
             <h4>📦 Almoxarife</h4>
             <p>Sem dados financeiros, sem valor de produto e sem autorização de pagamento.</p>
           </div>
-          <div class="access-card" id="card-admin" >
+          <div class="access-card" id="card-admin" onclick="selectRole('admin')">
             <h4>🧾 Compras / Administração</h4>
             <p>Visualização completa do fluxo de compras, orçamento e aprovação.</p>
           </div>
@@ -317,9 +317,10 @@ async function supaLogin(email, password) {
   const { data, error } = await supa.auth.signInWithPassword({ email, password });
   if (error) return { error: error.message };
   _currentUser = data.user;
-  // busca perfil
-  const { data: perfil } = await supa.from('perfis').select('role,nome').eq('id', data.user.id).single();
-  _currentRole = perfil?.role || 'almoxarife';
+  const { data: perfil, error: perfilError } = await supa.from('perfis').select('role,nome').eq('id', data.user.id).maybeSingle();
+  if (perfilError) return { error: 'Erro ao consultar perfil no Supabase: ' + perfilError.message };
+  if (!perfil?.role) return { error: 'Usuário autenticado, mas sem perfil cadastrado na tabela perfis.' };
+  _currentRole = perfil.role;
   return { ok: true, role: _currentRole, nome: perfil?.nome || email };
 }
 
@@ -332,8 +333,9 @@ async function supaRestoreSession() {
   const { data } = await supa.auth.getSession();
   if (data?.session?.user) {
     _currentUser = data.session.user;
-    const { data: perfil } = await supa.from('perfis').select('role,nome').eq('id', _currentUser.id).single();
-    _currentRole = perfil?.role || 'almoxarife';
+    const { data: perfil } = await supa.from('perfis').select('role,nome').eq('id', _currentUser.id).maybeSingle();
+    if (!perfil?.role) return null;
+    _currentRole = perfil.role;
     return { user: _currentUser, role: _currentRole, nome: perfil?.nome };
   }
   return null;
@@ -396,20 +398,26 @@ async function dbSalvarHistorico(entry) {
 // ════════════════════════════════════════════════
 async function uploadAnexo(file, pasta) {
   if (!file) return null;
-  const ext = file.name.split('.').pop();
+  const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
   const path = `${pasta}/${uid()}_${Date.now()}.${ext}`;
-  const { error } = await supa.storage.from('anexos').upload(path, file, { upsert: false });
-  if (error) throw error;
-  const { data } = supa.storage.from('anexos').getPublicUrl(path);
-  // signed URL for private bucket
+  const { error } = await supa.storage.from('anexos').upload(path, file, { upsert: false, contentType: file.type || undefined });
+  if (error) {
+    const msg = String(error.message || '');
+    if (msg.includes('not found') || msg.includes('Bucket not found')) throw new Error('Bucket anexos não encontrado no Supabase Storage.');
+    if (msg.toLowerCase().includes('row-level security') || msg.toLowerCase().includes('permission')) throw new Error('Sem permissão para enviar anexo. Verifique as policies do bucket anexos.');
+    throw error;
+  }
   const { data: signed } = await supa.storage.from('anexos').createSignedUrl(path, 60*60*24*365);
-  return { name: file.name, type: file.type, path, url: signed?.signedUrl || data?.publicUrl };
+  const publicData = supa.storage.from('anexos').getPublicUrl(path);
+  return { name: file.name, type: file.type, path, url: signed?.signedUrl || publicData?.data?.publicUrl || null };
 }
 
 async function abrirAnexoSupa(path) {
-  const { data } = await supa.storage.from('anexos').createSignedUrl(path, 3600);
-  if (data?.signedUrl) window.open(data.signedUrl, '_blank');
-  else toast('Não foi possível abrir o anexo');
+  const { data, error } = await supa.storage.from('anexos').createSignedUrl(path, 3600);
+  if (data?.signedUrl) return window.open(data.signedUrl, '_blank');
+  const publicData = supa.storage.from('anexos').getPublicUrl(path);
+  if (publicData?.data?.publicUrl) return window.open(publicData.data.publicUrl, '_blank');
+  toast('Não foi possível abrir o anexo' + (error?.message ? ': ' + error.message : ''));
 }
 
 // ════════════════════════════════════════════════
@@ -501,10 +509,12 @@ async function login(){
   const result = await supaLogin(email, pass);
   showLoading(false);
   if(result.error) return toast('Erro: ' + result.error);
+  if(state.selectedRole==='admin' && result.role!=='admin') return toast('Este usuário não está cadastrado como administração no Supabase.');
+  if(state.selectedRole==='almoxarife' && result.role!=='almoxarife' && result.role!=='admin') return toast('Este usuário não está cadastrado como almoxarife no Supabase.');
   state.accessRole = result.role;
   el('loginScreen').classList.remove('show');
   applyAccessRole();
-  el('sessionChip').innerHTML = `🔐 ${result.nome || result.role} <small>online</small>`;
+  el('sessionChip').innerHTML = `🔐 ${result.nome || result.role} <small>${result.role}</small>`;
   await syncAll();
   toast('Bem-vindo, ' + (result.nome || result.role));
 }
@@ -710,7 +720,8 @@ function orçamentoResumo(p){
   return `<div class="attachment-row"><div><strong>${safe(p.orcamento.name)}</strong><div class="hint">${detalhe}</div></div><div class="row-actions"><button class="link-btn" onclick="abrirAnexo('${p.id}','orcamento')">Abrir anexo</button></div></div>`;
 }
 function aprovacaoResumo(p){
-  const texto=canManageFinance()?'Etapa de aprovação com autorização de pagamento.':'Acompanhamento apenas visual da etapa de aprovação.';
+  if(!hasFinanceAccess()) return '<div class="hint">Etapa restrita ao setor de compras/administração.</div>';
+  const texto='Etapa de aprovação com autorização de pagamento.';
   return `<div class="attachment-row"><div><strong>${p.autorizacao_pagamento?"Pagamento autorizado":"Aguardando autorização"}</strong><div class="hint">${texto}</div></div>${p.orcamento?`<div class="row-actions"><button class="link-btn" onclick="abrirAnexo('${p.id}','orcamento')">Visualizar orçamento</button></div>`:""}</div>`;
 }
 function pedidoActions(p){
@@ -720,7 +731,7 @@ function pedidoActions(p){
   if(p.status==='AGUARDANDO APROVACAO' && canManageFinance()) actions.push(`<button class="btn btn-success" onclick="openModal('aprovacao',{id:'${p.id}'})">Autorizar pagamento</button>`);
   if(p.status==='APROVADO') actions.push(`<button class="btn btn-success" onclick="openModal('entrega',{id:'${p.id}'})">Registrar entrega</button>`);
   if(p.status==='ENTREGUE') actions.push(`<button class="btn btn-secondary" onclick="openModal('notaFiscal',{id:'${p.id}'})">${p.nota_fiscal?'Ver / trocar nota fiscal':'Anexar nota fiscal'}</button>`);
-  actions.push(`<button class="btn btn-secondary" onclick="openModal('pedido',{id:'${p.id}'})">Editar</button>`);
+  if(state.accessRole==='admin' || p.status==='NOVO PEDIDO') actions.push(`<button class="btn btn-secondary" onclick="openModal('pedido',{id:'${p.id}'})">Editar</button>`);
   return `<div class="actions">${actions.join('')}</div>`;
 }
 function pedidoCard(p){
@@ -905,6 +916,7 @@ async function salvarPedido(id){
   const antigo=state.pedidos.find(x=>x.id===id)||{};
   const materiais=coletarMateriaisPedido();
   if(!materiais.length) return toast('Adicione pelo menos um material válido');
+  if(id && state.accessRole==='almoxarife' && antigo.status!=='NOVO PEDIDO') return toast('O almoxarife só pode editar pedidos ainda em Novo pedido');
   const p={id:id||uid(),materiais,material:materiais[0].nome,qtd:materiais.reduce((s,m)=>s+Number(m.qtd||0),0),un:materiais.length===1?materiais[0].un:'itens',resp:el('p_resp').value.trim(),tipo_vinculo:el('p_tipo_vinculo').value,demanda:el('p_dem').value.trim(),urgencia:el('p_urg').value,status:id?(antigo.status||'NOVO PEDIDO'):'NOVO PEDIDO',valor_unit:Number(antigo.valor_unit||0),valor_total:Number(antigo.valor_total||0),obs:el('p_obs').value.trim(),data:new Date().toLocaleDateString('pt-BR'),data_iso:antigo.data_iso||isoHoje(),data_criacao:antigo.data_criacao||new Date().toISOString(),orcamento:antigo.orcamento||null,nota_fiscal:antigo.nota_fiscal||null,data_entrega:antigo.data_entrega||null,obs_entrega:antigo.obs_entrega||'',autorizacao_pagamento:Boolean(antigo.autorizacao_pagamento),prazo:el('p_prazo')?.value||antigo.prazo||null,hist_status:antigo.hist_status||[]};
   if(!id) addHistStatus(p,'','NOVO PEDIDO');
   if(!p.resp) return toast('Informe o solicitante');
@@ -1114,3 +1126,4 @@ document.getElementById('loginEmail')?.addEventListener('keydown',e=>{if(e.key==
 </script>
 </body>
 </html>
+
