@@ -195,7 +195,7 @@
       <div class="side-card">
         <h4>Fluxo de compras</h4>
         <p>Novo pedido → Em orçamento → Aguardando aprovação → Aprovado → Entregue.</p>
-        <div class="side-pill">Modo local ativo</div>
+        <div class="side-pill">Supabase conectado</div>
       </div>
     </aside>
     <main class="content">
@@ -222,7 +222,7 @@
       <section class="hero">
         <div class="hero-panel">
           <h3>Visão rápida do dia</h3>
-          <p>Abra este arquivo direto no navegador. Tudo fica salvo no <strong>localStorage</strong>, inclusive orçamento em PDF/print e autorização de pagamento.</p>
+          <p>Dados sincronizados em tempo real via Supabase. Acesse de qualquer dispositivo com internet.</p>
           <div class="hero-grid">
             <div class="hero-mini"><div class="lbl">Itens críticos</div><div class="val" id="heroCrit">0</div></div>
             <div class="hero-mini"><div class="lbl">Pedidos abertos</div><div class="val" id="heroPed">0</div></div>
@@ -282,9 +282,9 @@
           </div>
         </div>
         <div class="field full">
-          <label>Senha de acesso</label>
-          <input id="loginPassword" class="input" type="password" placeholder="Digite a senha local">
-          <div class="hint">Senha padrão do almoxarife: <strong>almox123</strong> | compras/admin: <strong>admin123</strong>.</div>
+          <label>Senha</label>
+          <input id="loginEmail" class="input" type="email" placeholder="Seu e-mail" style="margin-bottom:10px"><input id="loginPassword" class="input" type="password" placeholder="Sua senha">
+          <div class="hint">Use o e-mail e senha cadastrados pelo administrador. Primeiro acesso: crie os usuários no Supabase → Authentication → Users.</div>
         </div>
         <div class="actions">
           <button class="btn btn-primary" onclick="login()">Entrar no sistema</button>
@@ -296,6 +296,157 @@
   <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
   <div class="toast" id="toast"></div>
 
+
+<!-- Supabase SDK -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+// ════════════════════════════════════════════════
+// SUPABASE CONFIG
+// ════════════════════════════════════════════════
+const SUPA_URL = 'https://gklpopqpizixghvjqdvc.supabase.co';
+const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdrbHBvcHFwaXppeGdodmpxZHZjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ2NTQ5OTEsImV4cCI6MjA5MDIzMDk5MX0.JTSoT9d_LoU1ycnE7lUfuLcdDoynXifN4C23mzrZtM0';
+const supa = supabase.createClient(SUPA_URL, SUPA_KEY);
+
+// ════════════════════════════════════════════════
+// AUTH — login/logout real via Supabase Auth
+// ════════════════════════════════════════════════
+let _currentUser = null;
+let _currentRole = null;
+
+async function supaLogin(email, password) {
+  const { data, error } = await supa.auth.signInWithPassword({ email, password });
+  if (error) return { error: error.message };
+  _currentUser = data.user;
+  // busca perfil
+  const { data: perfil } = await supa.from('perfis').select('role,nome').eq('id', data.user.id).single();
+  _currentRole = perfil?.role || 'almoxarife';
+  return { ok: true, role: _currentRole, nome: perfil?.nome || email };
+}
+
+async function supaLogout() {
+  await supa.auth.signOut();
+  _currentUser = null; _currentRole = null;
+}
+
+async function supaRestoreSession() {
+  const { data } = await supa.auth.getSession();
+  if (data?.session?.user) {
+    _currentUser = data.session.user;
+    const { data: perfil } = await supa.from('perfis').select('role,nome').eq('id', _currentUser.id).single();
+    _currentRole = perfil?.role || 'almoxarife';
+    return { user: _currentUser, role: _currentRole, nome: perfil?.nome };
+  }
+  return null;
+}
+
+// ════════════════════════════════════════════════
+// DATA LAYER — substituição do localStorage
+// ════════════════════════════════════════════════
+async function dbCarregarItens() {
+  const { data, error } = await supa.from('itens').select('*').order('nome');
+  if (error) { console.error('itens:', error); return []; }
+  return data.map(i => ({...i, qty: Number(i.qty||0), min: Number(i.min||0)}));
+}
+
+async function dbSalvarItem(item) {
+  const { error } = await supa.from('itens').upsert(item, { onConflict: 'id' });
+  if (error) throw error;
+}
+
+async function dbExcluirItem(id) {
+  const { error } = await supa.from('itens').delete().eq('id', id);
+  if (error) throw error;
+}
+
+async function dbCarregarPedidos() {
+  const { data, error } = await supa.from('pedidos').select('*').order('data_criacao', { ascending: false });
+  if (error) { console.error('pedidos:', error); return []; }
+  return data.map(migratePedido);
+}
+
+async function dbSalvarPedido(pedido) {
+  const payload = {...pedido};
+  // jsonb fields
+  ['materiais','hist_status','cotacoes','orcamento','nota_fiscal'].forEach(k => {
+    if (payload[k] !== undefined && typeof payload[k] !== 'string')
+      payload[k] = payload[k]; // already object, supabase handles it
+  });
+  const { error } = await supa.from('pedidos').upsert(payload, { onConflict: 'id' });
+  if (error) throw error;
+}
+
+async function dbExcluirPedido(id) {
+  const { error } = await supa.from('pedidos').delete().eq('id', id);
+  if (error) throw error;
+}
+
+async function dbCarregarHistorico() {
+  const { data, error } = await supa.from('historico').select('*').order('criado_em', { ascending: false }).limit(300);
+  if (error) { console.error('historico:', error); return []; }
+  return data;
+}
+
+async function dbSalvarHistorico(entry) {
+  const { error } = await supa.from('historico').insert(entry);
+  if (error) console.error('historico insert:', error);
+}
+
+// ════════════════════════════════════════════════
+// STORAGE — upload de anexos
+// ════════════════════════════════════════════════
+async function uploadAnexo(file, pasta) {
+  if (!file) return null;
+  const ext = file.name.split('.').pop();
+  const path = `${pasta}/${uid()}_${Date.now()}.${ext}`;
+  const { error } = await supa.storage.from('anexos').upload(path, file, { upsert: false });
+  if (error) throw error;
+  const { data } = supa.storage.from('anexos').getPublicUrl(path);
+  // signed URL for private bucket
+  const { data: signed } = await supa.storage.from('anexos').createSignedUrl(path, 60*60*24*365);
+  return { name: file.name, type: file.type, path, url: signed?.signedUrl || data?.publicUrl };
+}
+
+async function abrirAnexoSupa(path) {
+  const { data } = await supa.storage.from('anexos').createSignedUrl(path, 3600);
+  if (data?.signedUrl) window.open(data.signedUrl, '_blank');
+  else toast('Não foi possível abrir o anexo');
+}
+
+// ════════════════════════════════════════════════
+// SYNC STATE — carrega tudo do banco
+// ════════════════════════════════════════════════
+async function syncAll() {
+  showLoading(true);
+  try {
+    const [itensDB, pedidosDB, histDB] = await Promise.all([
+      dbCarregarItens(), dbCarregarPedidos(), dbCarregarHistorico()
+    ]);
+    state.itens = itensDB;
+    state.pedidos = pedidosDB;
+    state.historico = histDB;
+  } catch(e) {
+    console.error('syncAll error:', e);
+    toast('Erro ao carregar dados do banco');
+  }
+  showLoading(false);
+  renderAll();
+}
+
+function showLoading(on) {
+  let el2 = document.getElementById('loadingOverlay');
+  if (!el2) {
+    el2 = document.createElement('div');
+    el2.id = 'loadingOverlay';
+    el2.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.7);backdrop-filter:blur(4px);z-index:999;display:grid;place-items:center;color:#fff;font-size:18px;font-weight:700;letter-spacing:.04em';
+    el2.innerHTML = '<div style="text-align:center"><div class="spin" style="width:40px;height:40px;border:3px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px"></div>Carregando dados...</div>';
+    document.body.appendChild(el2);
+    const style = document.createElement('style');
+    style.textContent = '@keyframes spin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(style);
+  }
+  el2.style.display = on ? 'grid' : 'none';
+}
+</script>
 <script>
 const STATUSS=['NOVO PEDIDO','EM ORCAMENTO','AGUARDANDO APROVACAO','APROVADO','ENTREGUE'];
 const FLUXO=['NOVO PEDIDO','EM ORCAMENTO','AGUARDANDO APROVACAO','APROVADO','ENTREGUE'];
@@ -341,34 +492,52 @@ function applyAccessRole(){
   const cfg=ACCESS[state.accessRole];
   if(cfg){document.body.classList.add(cfg.roleClass); el('sessionChip').innerHTML=`🔐 ${cfg.label} <small>acesso local</small>`;} else {el('sessionChip').textContent='🔒 Acesso não iniciado';}
 }
-function login(){
-  const role=state.selectedRole||'almoxarife';
-  const pass=el('loginPassword').value;
-  if(pass!==ACCESS[role].password) return toast('Senha inválida para o perfil selecionado');
-  state.accessRole=role;
-  localStorage.setItem(ACCESS_KEY,role);
+async function login(){
+  const email = el('loginEmail')?.value?.trim() || '';
+  const pass = el('loginPassword').value;
+  if(!email) return toast('Informe o e-mail');
+  if(!pass) return toast('Informe a senha');
+  showLoading(true);
+  const result = await supaLogin(email, pass);
+  showLoading(false);
+  if(result.error) return toast('Erro: ' + result.error);
+  state.accessRole = result.role;
   el('loginScreen').classList.remove('show');
   applyAccessRole();
-  renderAll();
-  toast(`Acesso liberado para ${ACCESS[role].label}`)
+  el('sessionChip').innerHTML = `🔐 ${result.nome || result.role} <small>online</small>`;
+  await syncAll();
+  toast('Bem-vindo, ' + (result.nome || result.role));
 }
-function logout(){
+async function logout(){
+  await supaLogout();
   state.accessRole=null;
-  localStorage.removeItem(ACCESS_KEY);
+  state.itens=[];state.pedidos=[];state.historico=[];
   el('loginPassword').value='';
+  if(el('loginEmail')) el('loginEmail').value='';
   el('loginScreen').classList.add('show');
   applyAccessRole();
+  renderAll();
 }
-function restoreAccess(){
-  const role=localStorage.getItem(ACCESS_KEY);
-  if(role && ACCESS[role]){state.accessRole=role; el('loginScreen').classList.remove('show');}
-  applyAccessRole();
+async function restoreAccess(){
+  showLoading(true);
+  const session = await supaRestoreSession();
+  showLoading(false);
+  if(session){
+    state.accessRole = session.role;
+    el('loginScreen').classList.remove('show');
+    applyAccessRole();
+    el('sessionChip').innerHTML = `🔐 ${session.nome || session.role} <small>online</small>`;
+    await syncAll();
+  } else {
+    applyAccessRole();
+  }
 }
 function previewAnexoHTML(anexo){
-  if(!anexo?.data) return '<div class="preview-empty">Nenhum anexo disponível.</div>';
-  if((anexo.type||'').includes('pdf')) return `<iframe src="${anexo.data}" height="320"></iframe>`;
-  if((anexo.type||'').startsWith('image/')) return `<img src="${anexo.data}" alt="Anexo">`;
-  return '<div class="preview-empty">Arquivo anexado. Use visualizar anexo.</div>';
+  const src = anexo?.url || anexo?.data;
+  if(!src) return '<div class="preview-empty">Nenhum anexo disponível.</div>';
+  if((anexo.type||'').includes('pdf')) return `<iframe src="${src}" height="320"></iframe>`;
+  if((anexo.type||'').startsWith('image/')) return `<img src="${src}" alt="Anexo">`;
+  return `<div class="preview-empty"><a href="${src}" target="_blank" style="color:var(--info)">📎 Abrir anexo</a></div>`;
 }
 
 function toast(msg){const t=el('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2400)}
@@ -426,7 +595,7 @@ function getResumoValoresNotas(list){
     }));
 }
 function badgeClassPedido(s){return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replaceAll(' ','_')}
-function save(){localStorage.setItem(STORAGE_KEY,JSON.stringify({itens:state.itens,pedidos:state.pedidos,historico:state.historico}))}
+function save(){ /* dados salvos diretamente no Supabase via dbSalvar* functions */ }
 function migratePedido(p){
   const novo={...p};
   if(novo.status==='PENDENTE') novo.status='NOVO PEDIDO';
@@ -468,7 +637,7 @@ function pedidoMateriaisHTML(p){
 }
 function load(){
   try{
-    const d=JSON.parse(localStorage.getItem(STORAGE_KEY)||localStorage.getItem('almox_v3_data')||localStorage.getItem('almox_v2_data')||'{}');
+    const d={}; // dados carregados via syncAll() do Supabase
     state.itens=(d.itens||[]).map(i=>({...i,qty:Number(i.qty||0),min:Number(i.min||0)}));
     state.pedidos=(d.pedidos||[]).map(migratePedido);
     state.historico=d.historico||[];
@@ -698,17 +867,39 @@ function coletarMateriaisPedido(){
   })).filter(m=>m.nome&&m.qtd>0);
 }
 function closeModal(){el('overlay').classList.remove('show');el('modal').innerHTML=''}
-function salvarItem(id){
+async function salvarItem(id){
   const item={id:id||uid(),nome:el('m_nome').value.trim(),cat:el('m_cat').value.trim()||'Geral',un:el('m_un').value.trim()||'un',qty:Number(el('m_qty').value||0),min:Number(el('m_min').value||0),loc:el('m_loc').value.trim()||'Almox',obs:el('m_obs').value.trim()};
   if(!item.nome) return toast('Informe o nome do material');
-  if(id){const i=state.itens.findIndex(x=>x.id===id);state.itens[i]=item}else{state.itens.unshift(item);if(item.qty>0){state.historico.unshift({id:uid(),tipo:'ENTRADA',item:item.nome,qtd:item.qty,saldo:item.qty,resp:'Cadastro inicial',demanda:'',data:agora(),obs:'Inclusão no sistema'})}}
-  save(); closeModal(); renderAll(); toast(id?'Material atualizado':'Material cadastrado');
+  try {
+    await dbSalvarItem(item);
+    if(id){const i=state.itens.findIndex(x=>x.id===id);if(i>=0)state.itens[i]=item;}
+    else{
+      state.itens.unshift(item);
+      if(item.qty>0){
+        const h={id:uid(),tipo:'ENTRADA',item:item.nome,item_id:item.id,qtd:item.qty,saldo:item.qty,resp:'Cadastro inicial',demanda:'',data:agora(),obs:'Inclusão no sistema'};
+        state.historico.unshift(h);
+        await dbSalvarHistorico(h);
+      }
+    }
+    closeModal(); renderAll(); toast(id?'Material atualizado':'Material cadastrado');
+  } catch(e){ toast('Erro ao salvar: '+e.message); }
 }
-function excluirItem(id){if(!confirm('Excluir este material?')) return; state.itens=state.itens.filter(i=>i.id!==id); save(); closeModal(); renderAll(); toast('Material excluído')}
-function registrarMov(tipo){
-  const id=el('mov_item').value,qtd=Number(el('mov_qtd').value||0),resp=el('mov_resp').value.trim(),dem=el('mov_dem').value.trim(),obs=el('mov_obs').value.trim();
-  const it=state.itens.find(i=>i.id===id); if(!it) return toast('Selecione o item'); if(qtd<=0) return toast('Informe uma quantidade válida'); if(tipo==='SAIDA'&&qtd>it.qty) return toast('Saída maior que o estoque atual');
-  it.qty=tipo==='ENTRADA'?it.qty+qtd:it.qty-qtd; state.historico.unshift({id:uid(),tipo,item:it.nome,qtd,saldo:it.qty,resp,demanda:dem,data:agora(),obs}); save(); closeModal(); renderAll(); toast(`${tipo==='ENTRADA'?'Entrada':'Saída'} registrada`)
+async function excluirItem(id){
+  if(!confirm('Excluir este material?')) return;
+  try{ await dbExcluirItem(id); state.itens=state.itens.filter(i=>i.id!==id); closeModal(); renderAll(); toast('Material excluído'); }
+  catch(e){ toast('Erro ao excluir: '+e.message); }
+}
+async function registrarMov(tipo){
+  const itemId=el('mov_item').value,qtd=Number(el('mov_qtd').value||0),resp=el('mov_resp').value.trim(),dem=el('mov_dem').value.trim(),obs=el('mov_obs').value.trim();
+  const it=state.itens.find(i=>i.id===itemId); if(!it) return toast('Selecione o item'); if(qtd<=0) return toast('Informe uma quantidade válida'); if(tipo==='SAIDA'&&qtd>it.qty) return toast('Saída maior que o estoque atual');
+  it.qty=tipo==='ENTRADA'?it.qty+qtd:it.qty-qtd;
+  const h={id:uid(),tipo,item:it.nome,item_id:it.id,qtd,saldo:it.qty,resp,demanda:dem,data:agora(),obs};
+  state.historico.unshift(h);
+  try{
+    await dbSalvarItem({...it});
+    await dbSalvarHistorico(h);
+    closeModal(); renderAll(); toast(`${tipo==='ENTRADA'?'Entrada':'Saída'} registrada`);
+  } catch(e){ toast('Erro: '+e.message); }
 }
 function salvarPedido(id){
   const antigo=state.pedidos.find(x=>x.id===id)||{};
@@ -718,20 +909,35 @@ function salvarPedido(id){
   if(!id) addHistStatus(p,'','NOVO PEDIDO');
   if(!p.resp) return toast('Informe o solicitante');
   if(!p.demanda) return toast('Informe o número da demanda ou da O.S.');
-  if(id){const i=state.pedidos.findIndex(x=>x.id===id);state.pedidos[i]=p}else state.pedidos.unshift(p);
-  save(); closeModal(); renderAll(); toast(id?'Pedido atualizado':'Pedido criado como Novo pedido');
+  try{
+    await dbSalvarPedido(p);
+    if(id){const i=state.pedidos.findIndex(x=>x.id===id);if(i>=0)state.pedidos[i]=p;}else state.pedidos.unshift(p);
+    closeModal(); renderAll(); toast(id?'Pedido atualizado':'Pedido criado como Novo pedido');
+  } catch(e){ toast('Erro ao salvar pedido: '+e.message); }
 }
-function excluirPedido(id){if(!confirm('Excluir este pedido?'))return; state.pedidos=state.pedidos.filter(p=>p.id!==id); save(); closeModal(); renderAll(); toast('Pedido excluído')}
-function avancarPedido(id){const p=state.pedidos.find(x=>x.id===id); if(!p) return; if(p.status==='NOVO PEDIDO'){const prev=p.status; p.status='EM ORCAMENTO'; addHistStatus(p,prev,'EM ORCAMENTO'); save(); renderAll(); toast('Pedido enviado para orçamento'); return;} if(p.status==='EM ORCAMENTO'){ if(!canManageFinance()) return toast('Somente compras/administração pode lançar orçamento'); return openModal('orcamento',{id}); } if(p.status==='AGUARDANDO APROVACAO'){ if(!canManageFinance()) return toast('Somente compras/administração pode aprovar'); return openModal('aprovacao',{id}); } if(p.status==='APROVADO') return marcarEntregue(id); toast('Pedido já está na etapa final');}
+async function excluirPedido(id){
+  if(!confirm('Excluir este pedido?'))return;
+  try{ await dbExcluirPedido(id); state.pedidos=state.pedidos.filter(p=>p.id!==id); closeModal(); renderAll(); toast('Pedido excluído'); }
+  catch(e){ toast('Erro ao excluir: '+e.message); }
+}
+function avancarPedido(id){const p=state.pedidos.find(x=>x.id===id); if(!p) return; if(p.status==='NOVO PEDIDO'){const prev=p.status; p.status='EM ORCAMENTO'; addHistStatus(p,prev,'EM ORCAMENTO'); dbSalvarPedido(p).catch(e=>toast('Erro: '+e.message)); renderAll(); toast('Pedido enviado para orçamento'); return;} if(p.status==='EM ORCAMENTO'){ if(!canManageFinance()) return toast('Somente compras/administração pode lançar orçamento'); return openModal('orcamento',{id}); } if(p.status==='AGUARDANDO APROVACAO'){ if(!canManageFinance()) return toast('Somente compras/administração pode aprovar'); return openModal('aprovacao',{id}); } if(p.status==='APROVADO') return marcarEntregue(id); toast('Pedido já está na etapa final');}
 async function salvarOrcamento(id){
   if(!canManageFinance()) return toast('Acesso restrito ao setor de compras/administração');
   const p=state.pedidos.find(x=>x.id===id); if(!p) return;
   const vu=Number(el('o_valor_unit').value||0),vt=Number(el('o_valor_total').value||0),file=el('o_file').files[0],obs=el('o_obs').value.trim();
-  if(!file) return toast('Anexe o orçamento em PDF ou print');
+  if(!file && !p.orcamento) return toast('Anexe o orçamento em PDF ou print');
   if(vu<=0 && vt<=0) return toast('Informe o valor do orçamento');
-  const total=vt>0?vt:vu*Number(p.qtd||0);
-  p.valor_unit=vu>0?vu:(total/Math.max(Number(p.qtd||1),1)); p.valor_total=total; p.obs=obs; p.orcamento={name:file.name,type:file.type||'application/octet-stream',data:await toBase64(file)}; const _prevOrc=p.status; p.status='AGUARDANDO APROVACAO'; addHistStatus(p,_prevOrc,'AGUARDANDO APROVACAO'); save(); closeModal(); renderAll(); toast('Orçamento anexado e pedido enviado para aprovação');
+  showLoading(true);
+  try{
+    const total=vt>0?vt:vu*Number(p.qtd||0);
+    p.valor_unit=vu>0?vu:(total/Math.max(Number(p.qtd||1),1)); p.valor_total=total; p.obs=obs;
+    if(file){ const anexo=await uploadAnexo(file,'orcamentos'); p.orcamento=anexo; }
+    const prev=p.status; p.status='AGUARDANDO APROVACAO'; addHistStatus(p,prev,'AGUARDANDO APROVACAO');
+    await dbSalvarPedido(p);
+    showLoading(false); closeModal(); renderAll(); toast('Orçamento anexado e pedido enviado para aprovação');
+  } catch(e){ showLoading(false); toast('Erro: '+e.message); }
 }
+
 async function salvarAprovacao(id){
   if(!canManageFinance()) return toast('Acesso restrito ao setor de compras/administração');
   const p=state.pedidos.find(x=>x.id===id); if(!p) return;
@@ -739,8 +945,12 @@ async function salvarAprovacao(id){
   const autorizado=el('a_aut').checked;
   if(!p.orcamento) return toast('Anexe primeiro o orçamento');
   if(!autorizado) return toast('Marque a autorização de pagamento para aprovar');
-  p.autorizacao_pagamento=true; p.obs=obs; const _prevAprov=p.status; p.status='APROVADO'; addHistStatus(p,_prevAprov,'APROVADO'); save(); closeModal(); renderAll(); toast('Pedido aprovado com autorização de pagamento');
+  const prev=p.status; p.autorizacao_pagamento=true; p.obs=obs; p.status='APROVADO';
+  addHistStatus(p,prev,'APROVADO');
+  try{ await dbSalvarPedido(p); closeModal(); renderAll(); toast('Pedido aprovado com autorização de pagamento'); }
+  catch(e){ toast('Erro: '+e.message); }
 }
+
 function salvarEntrega(id){
   const p=state.pedidos.find(x=>x.id===id); if(!p) return;
   if(p.status!=='APROVADO') return toast('Só é possível registrar entrega após aprovação');
@@ -751,7 +961,7 @@ function salvarEntrega(id){
   p.data_entrega=new Date(data+'T12:00:00').toISOString();
   p.obs_entrega=obs;
   addHistStatus(p,_prevEntrega,'ENTREGUE');
-  save(); closeModal(); renderAll(); toast('Entrega registrada. Agora a nota fiscal pode ser anexada');
+  dbSalvarPedido(p).then(()=>{ closeModal(); renderAll(); toast('Entrega registrada. Agora a nota fiscal pode ser anexada'); }).catch(e=>toast('Erro: '+e.message));
 }
 async function salvarNotaFiscal(id){
   const p=state.pedidos.find(x=>x.id===id); if(!p) return;
@@ -760,12 +970,25 @@ async function salvarNotaFiscal(id){
   const obs=el('nf_obs').value.trim();
   const file=el('nf_file').files[0];
   if(!file && !p.nota_fiscal) return toast('Anexe a nota fiscal em PDF ou imagem');
-  const anexo=file?{name:file.name,type:file.type||'application/octet-stream',data:await toBase64(file),numero,obs,data_upload:new Date().toISOString()}:({...p.nota_fiscal,numero,obs,data_upload:p.nota_fiscal?.data_upload||new Date().toISOString()});
-  p.nota_fiscal=anexo;
-  save(); closeModal(); renderAll(); toast('Nota fiscal anexada à solicitação');
+  showLoading(true);
+  try{
+    let anexo;
+    if(file){ const uploaded=await uploadAnexo(file,'notas_fiscais'); anexo={...uploaded,numero,obs,data_upload:new Date().toISOString()}; }
+    else{ anexo={...p.nota_fiscal,numero,obs}; }
+    p.nota_fiscal=anexo;
+    await dbSalvarPedido(p);
+    showLoading(false); closeModal(); renderAll(); toast('Nota fiscal anexada à solicitação');
+  } catch(e){ showLoading(false); toast('Erro no upload: '+e.message); }
 }
 function marcarEntregue(id){return openModal('entrega',{id})}
-function abrirAnexo(id,tipo){const p=state.pedidos.find(x=>x.id===id); const a=p?.[tipo]; if(!a?.data) return toast('Anexo não encontrado'); window.open(a.data,'_blank')}
+async function abrirAnexo(id,tipo){
+  const p=state.pedidos.find(x=>x.id===id); const a=p?.[tipo];
+  if(!a) return toast('Anexo não encontrado');
+  if(a.url) return window.open(a.url,'_blank');
+  if(a.path) return abrirAnexoSupa(a.path);
+  if(a.data) return window.open(a.data,'_blank'); // fallback base64 legacy
+  toast('Anexo não encontrado');
+}
 function exportarCSV(tipo){
   let rows=[];
   if(tipo==='itens') rows=[['ID','Nome','Categoria','Unidade','Quantidade','Mínimo','Local','Observações'],...state.itens.map(i=>[i.id,i.nome,i.cat,i.un,i.qty,i.min,i.loc,i.obs||''])];
@@ -773,7 +996,10 @@ function exportarCSV(tipo){
   const csv=rows.map(r=>r.map(v=>`"${String(v).replaceAll('"','""')}"`).join(';')).join('\n');
   downloadData(URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'})),`almox_${tipo}_${Date.now()}.csv`)
 }
-function exportarJSON(){downloadData(URL.createObjectURL(new Blob([JSON.stringify({itens:state.itens,pedidos:state.pedidos,historico:state.historico},null,2)],{type:'application/json'})),`backup_almox_${Date.now()}.json`)}
+function exportarJSON(){
+  const dados={itens:state.itens,pedidos:state.pedidos.map(p=>({...p,orcamento:p.orcamento?{...p.orcamento,data:undefined}:null,nota_fiscal:p.nota_fiscal?{...p.nota_fiscal,data:undefined}:null})),historico:state.historico};
+  downloadData(URL.createObjectURL(new Blob([JSON.stringify(dados,null,2)],{type:'application/json'})),`backup_prumo_${Date.now()}.json`);
+}
 function resetarDados(){if(!confirm('Limpar todos os dados locais deste navegador?')) return; localStorage.removeItem(STORAGE_KEY); load(); restoreAccess(); renderAll(); toast('Dados locais resetados')}
 // ════════ PRAZO / SEMÁFORO ════════
 function prazoBadge(p){
@@ -879,9 +1105,9 @@ function renderGraficoOS(){
 }
 
 restoreTheme();
-load();
-restoreAccess();
-renderAll();
+load(); // inicializa state com arrays vazios
+renderAll(); // renderiza tela de login
+restoreAccess(); // tenta restaurar sessão Supabase (async)
 document.getElementById('loginPassword')?.addEventListener('keydown',e=>{if(e.key==='Enter') login()});
 
 </script>
